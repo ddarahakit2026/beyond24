@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC SFU 회의실</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .video-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 1rem;
+            padding: 1rem;
+        }
+        video {
+            width: 100%;
+            border-radius: 0.75rem;
+            background-color: #1f2937;
+            transform: scaleX(-1); /* 셀카 모드 */
+        }
+        .user-label {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.5);
+            color: white;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white min-h-screen">
+    <div class="max-w-6xl mx-auto p-4">
+        <header class="flex justify-between items-center mb-8 border-b border-gray-700 pb-4">
+            <h1 class="text-2xl font-bold text-blue-400">WebRTC Multi-Conference</h1>
+            <div class="flex gap-2">
+                <input id="roomIdInput" type="text" placeholder="방 아이디 입력" value="test-room" 
+                       class="bg-gray-800 border border-gray-600 px-3 py-1 rounded text-white focus:outline-none focus:border-blue-500">
+                <button id="joinBtn" class="bg-blue-600 hover:bg-blue-700 px-4 py-1 rounded transition">참여하기</button>
+            </div>
+        </header>
+
+        <main id="videoGrid" class="video-container">
+            <!-- 나(Local) 비디오 -->
+            <div class="relative group" id="localVideoContainer">
+                <video id="localVideo" autoplay playsinline muted></video>
+                <div class="user-label">나 (Local)</div>
+            </div>
+        </main>
+
+        <div id="status" class="fixed bottom-4 right-4 text-sm text-gray-400">
+            서버 연결 대기 중...
+        </div>
+    </div>
+
+    <script>
+        const roomIdInput = document.getElementById('roomIdInput');
+        const joinBtn = document.getElementById('joinBtn');
+        const videoGrid = document.getElementById('videoGrid');
+        const localVideo = document.getElementById('localVideo');
+        const statusEl = document.getElementById('status');
+
+        let localStream;
+        let ws;
+        let peerConnections = {}; // userId -> RTCPeerConnection
+        
+        const config = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' }
+            ]
+        };
+
+        // 1. 미디어 장치 초기화
+        async function initMedia() {
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                localVideo.srcObject = localStream;
+            } catch (e) {
+                console.error('미디어 장치 접근 실패:', e);
+                alert('카메라/마이크 권한이 필요합니다.');
+            }
+        }
+
+        // 2. 서버 연결 및 메시지 처리
+        function connectServer() {
+            ws = new WebSocket('ws://localhost:8080');
+
+            ws.onopen = () => {
+                statusEl.innerText = '서버 연결 완료';
+                statusEl.classList.add('text-green-400');
+            };
+
+            ws.onmessage = async (message) => {
+                const data = JSON.parse(message.data);
+                console.log('수신 메시지:', data.type, data);
+
+                switch (data.type) {
+                    case 'room-users':
+                        // 기존 참여자들에게 Offer 생성 (내가 들어갔을 때)
+                        data.users.forEach(userId => makeOffer(userId));
+                        break;
+                    case 'new-user':
+                        // 새로운 참여자가 들어옴 (기다리면 그쪽에서 Offer를 보낼 것임)
+                        console.log('새 유저 입장:', data.userId);
+                        break;
+                    case 'offer':
+                        handleOffer(data.from, data.offer);
+                        break;
+                    case 'answer':
+                        handleAnswer(data.from, data.answer);
+                        break;
+                    case 'candidate':
+                        handleCandidate(data.from, data.candidate);
+                        break;
+                    case 'user-left':
+                        removePeer(data.userId);
+                        break;
+                }
+            };
+
+            ws.onclose = () => {
+                statusEl.innerText = '서버 연결 끊김';
+                statusEl.classList.replace('text-green-400', 'text-red-400');
+            };
+        }
+
+        // 3. PeerConnection 생성 공통 함수
+        function createPeerConnection(userId) {
+            const pc = new RTCPeerConnection(config);
+            peerConnections[userId] = pc;
+
+            // 트랙 추가 (내 화면 전달)
+            localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+            // ICE Candidate 발생 시 전송
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    ws.send(JSON.stringify({
+                        type: 'candidate',
+                        to: userId,
+                        candidate: event.candidate
+                    }));
+                }
+            };
+
+            // 상대방 스트림 수신 시 비디오 UI 생성
+            pc.ontrack = (event) => {
+                if (!document.getElementById(`video-${userId}`)) {
+                    const container = document.createElement('div');
+                    container.id = `container-${userId}`;
+                    container.className = 'relative group';
+                    
+                    const video = document.createElement('video');
+                    video.id = `video-${userId}`;
+                    video.autoplay = true;
+                    video.playsinline = true;
+                    video.srcObject = event.streams[0];
+                    
+                    const label = document.createElement('div');
+                    label.className = 'user-label';
+                    label.innerText = `참여자: ${userId}`;
+
+                    container.appendChild(video);
+                    container.appendChild(label);
+                    videoGrid.appendChild(container);
+                }
+            };
+
+            return pc;
+        }
+
+        // 4. Offer 생성 (발신자)
+        async function makeOffer(userId) {
+            const pc = createPeerConnection(userId);
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+
+            ws.send(JSON.stringify({
+                type: 'offer',
+                to: userId,
+                offer: offer
+            }));
+        }
+
+        // 5. Offer 수신 및 Answer 생성 (수신자)
+        async function handleOffer(userId, offer) {
+            const pc = createPeerConnection(userId);
+            await pc.setRemoteDescription(new RTCSessionDescription(offer));
+            
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+
+            ws.send(JSON.stringify({
+                type: 'answer',
+                to: userId,
+                answer: answer
+            }));
+        }
+
+        // 6. Answer 수신
+        async function handleAnswer(userId, answer) {
+            const pc = peerConnections[userId];
+            if (pc) {
+                await pc.setRemoteDescription(new RTCSessionDescription(answer));
+            }
+        }
+
+        // 7. Candidate 수신
+        async function handleCandidate(userId, candidate) {
+            const pc = peerConnections[userId];
+            if (pc) {
+                await pc.addIceCandidate(new RTCIceCandidate(candidate));
+            }
+        }
+
+        // 8. 참여자 이탈 처리
+        function removePeer(userId) {
+            if (peerConnections[userId]) {
+                peerConnections[userId].close();
+                delete peerConnections[userId];
+            }
+            const container = document.getElementById(`container-${userId}`);
+            if (container) container.remove();
+        }
+
+        // 실행
+        joinBtn.onclick = () => {
+            const roomId = roomIdInput.value;
+            if (!roomId) return alert('방 아이디를 입력하세요');
+            
+            ws.send(JSON.stringify({
+                type: 'join',
+                roomId: roomId
+            }));
+            
+            joinBtn.disabled = true;
+            joinBtn.innerText = '참여 중...';
+            roomIdInput.disabled = true;
+        };
+
+        initMedia().then(connectServer);
+    </script>
+</body>
+</html>
